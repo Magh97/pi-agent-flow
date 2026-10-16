@@ -1,0 +1,23 @@
+# dependencies
+node_modules/
+
+# build artifacts
+*.tgz
+dist/
+build/
+
+# editor / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# logs
+*.log
+npm-debug.log*
+
+# local install outputs
+.pi/
+
+# runtime scratch
+*.tmp

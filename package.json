@@ -1,0 +1,18 @@
+{
+	"name": "pi-multi-agent",
+	"version": "1.0.0",
+	"private": true,
+	"type": "module",
+	"description": "Multi-agent orchestrator for Pi: dev, dba, docker and qa child agents driven by an orchestrate tool.",
+	"pi": {
+		"extensions": ["./extension/index.ts"],
+		"prompts": ["./prompts/*.md"]
+	},
+	"peerDependencies": {
+		"@earendil-works/pi-agent-core": "*",
+		"@earendil-works/pi-ai": "*",
+		"@earendil-works/pi-coding-agent": "*",
+		"@earendil-works/pi-tui": "*",
+		"typebox": "*"
+	}
+}
