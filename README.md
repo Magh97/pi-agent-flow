@@ -158,7 +158,7 @@ an untrusted project. Only enable this for repositories you trust.
 | Symptom | Cause / fix |
 |---|---|
 | `orchestrate` tool missing | Extension not copied or Pi not restarted. Run `node install.mjs --check`, then `/reload`. The entry point must be `extensions/multi-agent/index.ts`. |
-| `Unknown agent: "dev"` | Definitions missing from `~/.pi/agent/agents`. Re-run the installer. |
+| `Unknown agent: "dev"` | Definitions missing from `~/.pi/agent/agents`. Re-run the installer. If the error also lists *Skipped agent file(s)*, that file has invalid YAML or a missing `name`/`description`; fix it and the agent will load again. A broken file never disables the other agents. |
 | Child fails instantly with empty output | `pi` not resolvable. Set `PI_ORCHESTRATOR_BIN` to the full path of `pi` (`pi.cmd` on Windows) or ensure `pi` is on `PATH`. |
 | Agent uses the wrong model | A `model:` field in that agent's frontmatter overrides your active model. |
 | Everything is slow / expensive | Prefer `single`/short chains, set a cheaper `model:` for `scout`, and remember each parallel task is a full child session. |

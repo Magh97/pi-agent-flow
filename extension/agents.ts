@@ -12,8 +12,11 @@
  *   System prompt goes here.
  *
  * Locations:
- *   - <agent-dir>/agents/*.md          user-level (always loaded)
+ *   - <agent-dir>/agents/*.md          user-level (loaded unless agentScope is "project")
  *   - <project>/.pi/agents/*.md        project-level (only with agentScope "project"/"both")
+ *
+ * A malformed file is skipped with a diagnostic; it never breaks discovery for
+ * the remaining agents.
  */
 
 import * as fs from "node:fs";
@@ -32,9 +35,15 @@ export interface AgentConfig {
 	filePath: string;
 }
 
+export interface AgentDiagnostic {
+	filePath: string;
+	reason: string;
+}
+
 export interface AgentDiscoveryResult {
 	agents: AgentConfig[];
 	projectAgentsDir: string | null;
+	diagnostics: AgentDiagnostic[];
 }
 
 /**
@@ -64,7 +73,11 @@ function parseToolList(value: unknown): string[] | undefined {
 	return tools.length > 0 ? tools : undefined;
 }
 
-function loadAgentsFromDir(dir: string, source: "user" | "project"): AgentConfig[] {
+function loadAgentsFromDir(
+	dir: string,
+	source: "user" | "project",
+	diagnostics: AgentDiagnostic[] = [],
+): AgentConfig[] {
 	const agents: AgentConfig[] = [];
 
 	if (!fs.existsSync(dir)) {
@@ -86,13 +99,26 @@ function loadAgentsFromDir(dir: string, source: "user" | "project"): AgentConfig
 		let content: string;
 		try {
 			content = fs.readFileSync(filePath, "utf-8");
-		} catch {
+		} catch (err) {
+			diagnostics.push({ filePath, reason: `unreadable (${(err as Error).message})` });
 			continue;
 		}
 
-		const { frontmatter, body } = parseFrontmatter<AgentFrontmatter>(content);
+		// A single malformed file must not take down every other agent, so parse
+		// failures are isolated to this file and reported as a diagnostic.
+		let frontmatter: AgentFrontmatter | null = null;
+		let body = "";
+		try {
+			const parsed = parseFrontmatter<AgentFrontmatter>(content);
+			frontmatter = parsed.frontmatter ?? null;
+			body = parsed.body ?? "";
+		} catch (err) {
+			diagnostics.push({ filePath, reason: `invalid YAML (${(err as Error).message.split("\n")[0]})` });
+			continue;
+		}
 
 		if (typeof frontmatter.name !== "string" || typeof frontmatter.description !== "string") {
+			diagnostics.push({ filePath, reason: "missing required string frontmatter: name/description" });
 			continue;
 		}
 
@@ -133,9 +159,11 @@ function findNearestProjectAgentsDir(cwd: string): string | null {
 export function discoverAgents(cwd: string, scope: AgentScope): AgentDiscoveryResult {
 	const userDir = path.join(getAgentDir(), "agents");
 	const projectAgentsDir = findNearestProjectAgentsDir(cwd);
+	const diagnostics: AgentDiagnostic[] = [];
 
-	const userAgents = scope === "project" ? [] : loadAgentsFromDir(userDir, "user");
-	const projectAgents = scope === "user" || !projectAgentsDir ? [] : loadAgentsFromDir(projectAgentsDir, "project");
+	const userAgents = scope === "project" ? [] : loadAgentsFromDir(userDir, "user", diagnostics);
+	const projectAgents =
+		scope === "user" || !projectAgentsDir ? [] : loadAgentsFromDir(projectAgentsDir, "project", diagnostics);
 
 	const agentMap = new Map<string, AgentConfig>();
 
@@ -148,7 +176,7 @@ export function discoverAgents(cwd: string, scope: AgentScope): AgentDiscoveryRe
 		for (const agent of projectAgents) agentMap.set(agent.name, agent);
 	}
 
-	return { agents: Array.from(agentMap.values()), projectAgentsDir };
+	return { agents: Array.from(agentMap.values()), projectAgentsDir, diagnostics };
 }
 
 export function formatAgentList(agents: AgentConfig[], maxItems: number): { text: string; remaining: number } {

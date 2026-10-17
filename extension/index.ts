@@ -33,7 +33,7 @@ import {
 } from "@earendil-works/pi-coding-agent";
 import { Container, Markdown, Spacer, Text } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
-import { type AgentConfig, type AgentScope, discoverAgents } from "./agents.ts";
+import { type AgentConfig, type AgentDiagnostic, type AgentScope, discoverAgents } from "./agents.ts";
 
 const MAX_PARALLEL_TASKS = 8;
 const COLLAPSED_ITEM_COUNT = 10;
@@ -217,6 +217,15 @@ function truncateParallelOutput(output: string): string {
 	return `${truncated}\n\n[Output truncated: ${byteLength - Buffer.byteLength(truncated, "utf8")} bytes omitted. Full output preserved in tool details.]`;
 }
 
+/** Render skipped/invalid agent files so a missing agent is explained, not silent. */
+function formatDiagnostics(diagnostics: AgentDiagnostic[]): string {
+	if (diagnostics.length === 0) return "";
+	const shown = diagnostics.slice(0, 5);
+	const lines = shown.map((d) => `  - ${path.basename(d.filePath)}: ${d.reason}`);
+	if (diagnostics.length > shown.length) lines.push(`  ... +${diagnostics.length - shown.length} more`);
+	return `\n\nSkipped agent file(s):\n${lines.join("\n")}`;
+}
+
 type DisplayItem = { type: "text"; text: string } | { type: "toolCall"; name: string; args: Record<string, any> };
 
 function getDisplayItems(messages: Message[]): DisplayItem[] {
@@ -363,6 +372,7 @@ async function runSingleAgent(
 	defaultCwd: string,
 	dispatchDefaults: DispatchDefaults,
 	agents: AgentConfig[],
+	diagnostics: AgentDiagnostic[],
 	agentName: string,
 	task: string,
 	context: string | undefined,
@@ -385,7 +395,7 @@ async function runSingleAgent(
 			label,
 			exitCode: 1,
 			messages: [],
-			stderr: `Unknown agent: "${agentName}". Available agents: ${available}.`,
+			stderr: `Unknown agent: "${agentName}". Available agents: ${available}.${formatDiagnostics(diagnostics)}`,
 			usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, contextTokens: 0, turns: 0 },
 			step,
 		};
@@ -641,7 +651,7 @@ export default function (pi: ExtensionAPI) {
 					content: [
 						{
 							type: "text",
-							text: `Invalid parameters. Provide exactly one mode (single, parallel, or chain).\nAvailable agents: ${available}`,
+							text: `Invalid parameters. Provide exactly one mode (single, parallel, or chain).\nAvailable agents: ${available}${formatDiagnostics(discovery.diagnostics)}`,
 						},
 					],
 					details: makeDetails("single")([]),
@@ -716,6 +726,7 @@ export default function (pi: ExtensionAPI) {
 						ctx.cwd,
 						dispatchDefaults,
 						agents,
+						discovery.diagnostics,
 						step.agent,
 						taskWithContext,
 						step.context,
@@ -797,6 +808,7 @@ export default function (pi: ExtensionAPI) {
 						ctx.cwd,
 						dispatchDefaults,
 						agents,
+						discovery.diagnostics,
 						t.agent,
 						t.task,
 						t.context,
@@ -843,6 +855,7 @@ export default function (pi: ExtensionAPI) {
 					ctx.cwd,
 					dispatchDefaults,
 					agents,
+					discovery.diagnostics,
 					params.agent,
 					params.task,
 					params.context,
@@ -869,7 +882,9 @@ export default function (pi: ExtensionAPI) {
 
 			const available = agents.map((a) => `${a.name} (${a.source})`).join(", ") || "none";
 			return {
-				content: [{ type: "text", text: `Invalid parameters. Available agents: ${available}` }],
+				content: [
+					{ type: "text", text: `Invalid parameters. Available agents: ${available}${formatDiagnostics(discovery.diagnostics)}` },
+				],
 				details: makeDetails("single")([]),
 			};
 		},
