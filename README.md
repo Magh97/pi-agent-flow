@@ -142,6 +142,83 @@ that wrote the code.
 - **Budget guard.** Prefer 2-4 steps. On failure: one corrected retry, then
   escalate. Every result reports turns and cost.
 
+## Overnight queue runner
+
+Runs a list of tasks unattended, one autonomous session per task, with hard
+time and cost caps. This is the "leave it running overnight" mode.
+
+```powershell
+cd C:\path\to\your\project
+node C:\Users\qwert\pi-multi-agent\runner\queue.mjs --tasks runner\tasks.md
+```
+
+Task file (Markdown checkboxes; the runner ticks them as tasks complete, so
+progress shows up in git and re-runs are safe):
+
+```markdown
+# Tasks
+
+- [ ] Add a truncate(s, max) helper with tests and verify the suite passes.
+- [x] Already finished - skipped on re-run.
+- [ ] |
+    Multi-line tasks use a bare `|`; indented lines below are joined.
+    Keep one task to one deliverable.
+```
+
+| Option | Default | Purpose |
+|---|---|---|
+| `--tasks <file>` | `runner/tasks.md` | Task list |
+| `--cwd <dir>` | current dir | Where sessions run |
+| `--timeout <min>` | `30` | Wall-clock cap per task; the process tree is killed on expiry |
+| `--max-cost-per-task <usd>` | `3.00` | Abort a task past this spend |
+| `--max-cost-total <usd>` | `25.00` | Lifetime run budget; checked before each task |
+| `--retries <n>` | `1` | Retries after failure/timeout |
+| `--model <provider/id>` | pi settings | Force a model for every task |
+| `--stop-on-blocked` | off | Stop the run on the first escalation |
+| `--before-task <cmd>` | - | Shell hook before each task (e.g. a git checkpoint) |
+| `--dry-run` | - | Show the plan, run nothing |
+
+**Controls**
+
+- Create `<state dir>/STOP` at any time to halt cleanly before the next task.
+- Re-run the same command to resume: finished tasks are skipped, failures and
+  blocked tasks are retried.
+- State lives in `runner/.queue/`: `state.json` (cost + completed), `run.jsonl`
+  (one JSON record per attempt, including the agent's report and blocked reason).
+
+**Overnight recipe**
+
+```powershell
+# 1. Write your tasks
+notepad runner\tasks.md
+
+# 2. Commit a clean starting point (so you can diff what happened)
+git add -A; git commit -m "before overnight run"
+
+# 3. Start it and leave
+node C:\Users\qwert\pi-multi-agent\runner\queue.mjs --tasks runner\tasks.md `
+  --timeout 30 --max-cost-total 25 --before-task "git add -A"
+
+# 4. Morning: see what changed
+git status; git diff
+Get-Content runner\.queue\run.jsonl | Select-Object -Last 5
+```
+
+**What it guarantees**
+
+- One task at a time - never two writers in the same repository.
+- Per-task timeout with a full process-tree kill, plus per-task and lifetime
+  cost caps.
+- Escalation is respected: a task that needs human authorization reports
+  `STATUS: BLOCKED - <reason>`, is logged, and does not block the rest of the
+  queue (unless you pass `--stop-on-blocked`).
+- Every attempt is recorded with cost, turns, duration and the agent's report.
+
+**What it does not do**: commit or branch per task (use `--before-task` or
+review the diff in the morning), and it cannot authorize what the agents are
+instructed to escalate - destructive data work and production infrastructure
+still require you.
+
 ## Security
 
 Child agents are separate `pi` processes with the same OS permissions as your

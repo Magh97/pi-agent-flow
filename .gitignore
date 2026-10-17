@@ -21,3 +21,6 @@ npm-debug.log*
 
 # runtime scratch
 *.tmp
+
+# queue runner runtime state (local cost/log data)
+runner/.queue/
