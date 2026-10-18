@@ -47,6 +47,12 @@ planning, but all changes happen inside child agents.
   subsystems, or a `qa` review of area A alongside a `scout` survey of area B.
   Never serialize independent work into a chain; that wastes wall-clock time.
   Only use `maxConcurrency` when a provider rate limit requires throttling.
+- **Do not block the user.** If a fan-out will clearly outlast the user's
+  patience (large multi-step chains, long-running recon), set
+  `background: true` so the conversation stays free and the report is delivered
+  when the job settles. Announce the job id and that you will report back.
+  Do not background trivial dispatches, and never reuse work already running
+  in a background job.
 - **One writer at a time.** Parallel mode starts all tasks simultaneously, so
   never put two file-writing agents in the same parallel call (their edits can
   conflict). Writers run as separate sequential steps or as separate turns.

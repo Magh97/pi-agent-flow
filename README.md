@@ -178,6 +178,27 @@ progress shows up in git and re-runs are safe):
 | `--before-task <cmd>` | - | Shell hook before each task (e.g. a git checkpoint) |
 | `--dry-run` | - | Show the plan, run nothing |
 
+**2. Background mode — keep the conversation free**
+
+A long fan-out normally blocks the turn until every child finishes. Pass
+`background: true` and the tool returns a job id immediately; the children keep
+running while you continue the conversation, and the combined report is
+delivered back into the session as a new turn when the job settles.
+
+```
+orchestrate: { background: true, chain: [{ agent: "dev", task: "..." }, { agent: "qa", task: "..." }] }
+```
+
+- Works with all three modes (single, parallel, chain).
+- `/orchestrate-jobs` lists this session's background jobs and their state.
+- Three or more independent jobs can run at once, but jobs that write to the
+  same files still must not overlap - the one-writer rule does not change.
+- Jobs live in the session: closing it aborts any job still running, so use the
+  [queue runner](#overnight-queue-runner) for unattended work.
+- Requires a live session. In `--print` mode the process usually exits before a
+  background job finishes, so its report has nowhere to land - use `background`
+  interactively or use the queue runner instead.
+
 **Controls**
 
 - Create `<state dir>/STOP` at any time to halt cleanly before the next task.

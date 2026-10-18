@@ -179,6 +179,17 @@ interface OrchestrateDetails {
 	results: SingleResult[];
 }
 
+interface BackgroundJob {
+	id: string;
+	mode: "single" | "parallel" | "chain";
+	label: string;
+	startedAt: number;
+	status: "running" | "done" | "failed";
+	abort: AbortController;
+	results: SingleResult[];
+	cost: number;
+}
+
 // ---------------------------------------------------------------------------
 // Message extraction
 // ---------------------------------------------------------------------------
@@ -382,6 +393,7 @@ async function runSingleAgent(
 	signal: AbortSignal | undefined,
 	onUpdate: OnUpdateCallback | undefined,
 	makeDetails: (results: SingleResult[]) => OrchestrateDetails,
+	background = false,
 ): Promise<SingleResult> {
 	const agent = agents.find((a) => a.name === agentName);
 
@@ -453,8 +465,12 @@ async function runSingleAgent(
 			const proc = spawn(invocation.command, invocation.args, {
 				cwd: cwd ?? defaultCwd,
 				shell: false,
+				// Background children get their own session/process group so the
+				// parent tool call (and its abort signal) no longer owns their life.
+				detached: background || process.platform !== "win32",
 				stdio: ["ignore", "pipe", "pipe"],
 			});
+			if (background) proc.unref?.();
 			let buffer = "";
 
 			const processLine = (line: string) => {
@@ -588,6 +604,13 @@ const OrchestrateParams = Type.Object({
 	chain: Type.Optional(
 		Type.Array(ChainItem, { description: "Array of {agent, task, context, label} for sequential execution" }),
 	),
+	background: Type.Optional(
+		Type.Boolean({
+			description:
+				"Return immediately with a job id instead of waiting. The child agents keep running while the conversation continues, and their combined report is delivered back into the session when the job finishes. Use this for long fan-outs the user does not need to watch, and for anything the user asked to run in the background or 'while they do something else'.",
+			default: false,
+		}),
+	),
 	agentScope: Type.Optional(AgentScopeSchema),
 	maxConcurrency: Type.Optional(
 		Type.Number({
@@ -602,10 +625,222 @@ const OrchestrateParams = Type.Object({
 });
 
 // ---------------------------------------------------------------------------
+// Background jobs
+//
+// A background dispatch returns to the conversation immediately while its
+// child processes keep running. When the job settles, its report is injected
+// back into the session as a custom message that triggers a new turn.
+// ---------------------------------------------------------------------------
+
+const BACKGROUND_EVENT = "orchestrate_background";
+
+interface BackgroundContext {
+	agents: AgentConfig[];
+	diagnostics: AgentDiagnostic[];
+	cwd: string;
+	agentScope: AgentScope;
+	defaults: DispatchDefaults;
+}
+
+function startBackgroundJob(
+	pi: ExtensionAPI,
+	ctx: { hasUI: boolean; ui: { notify: (text: string, level?: string) => void } },
+	jobs: Map<string, BackgroundJob>,
+	mode: "single" | "parallel" | "chain",
+	label: string,
+	params: any,
+	bg: BackgroundContext,
+	makeDetails: (results: SingleResult[]) => OrchestrateDetails,
+): { id: string } {
+	const id = `bg-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 6)}`;
+	const job: BackgroundJob = {
+		id,
+		mode,
+		label,
+		startedAt: Date.now(),
+		status: "running",
+		abort: new AbortController(),
+		results: [],
+		cost: 0,
+	};
+	jobs.set(id, job);
+
+	const run = async (): Promise<SingleResult[]> => {
+		if (mode === "chain") {
+			const results: SingleResult[] = [];
+			let previousOutput = "";
+			for (let i = 0; i < params.chain.length; i++) {
+				const step = params.chain[i];
+				const stepNumber = i + 1;
+				const digest = buildHandoffDigest(results);
+				const taskWithContext = step.task
+					.replace(/\{previous\}/g, previousOutput)
+					.replace(/\{context\}/g, digest)
+					.replace(/\{step\}/g, String(stepNumber));
+				const result = await runSingleAgent(
+					bg.cwd,
+					bg.defaults,
+					bg.agents,
+					bg.diagnostics,
+					step.agent,
+					taskWithContext,
+					step.context,
+					step.cwd,
+					stepNumber,
+					step.label,
+					job.abort.signal,
+					undefined,
+					makeDetails,
+					true,
+				);
+				results.push(result);
+				job.results = [...results];
+				if (isFailedResult(result)) break;
+				previousOutput = getFinalOutput(result.messages);
+			}
+			return results;
+		}
+
+		if (mode === "parallel") {
+			const settled = await mapWithConcurrencyLimit(params.tasks, params.maxConcurrency, (t) =>
+				runSingleAgent(
+					bg.cwd,
+					bg.defaults,
+					bg.agents,
+					bg.diagnostics,
+					t.agent,
+					t.task,
+					t.context,
+					t.cwd,
+					undefined,
+					undefined,
+					job.abort.signal,
+					undefined,
+					makeDetails,
+					true,
+				),
+			);
+			job.results = settled;
+			return settled;
+		}
+
+		const settled = [
+			await runSingleAgent(
+				bg.cwd,
+				bg.defaults,
+				bg.agents,
+				bg.diagnostics,
+				params.agent,
+				params.task,
+				params.context,
+				params.cwd,
+				undefined,
+				undefined,
+				job.abort.signal,
+				undefined,
+				makeDetails,
+				true,
+			),
+		];
+		job.results = settled;
+		return settled;
+	};
+
+	void (async () => {
+		try {
+			const results = await run();
+			job.cost = results.reduce((sum, r) => sum + r.usage.cost, 0);
+			const failed = results.some(isFailedResult);
+			job.status = failed && results.every(isFailedResult) ? "failed" : "done";
+
+			const sections = results.map((r) => {
+				const status = isFailedResult(r) ? "failed" : "completed";
+				const name = r.step ? `${r.label ?? r.agent} (step ${r.step})` : r.agent;
+				return `### ${name} - ${status}\n\n${getResultOutput(r)}`;
+			});
+			const turns = results.reduce((sum, r) => sum + r.usage.turns, 0);
+			const duration = Math.round((Date.now() - job.startedAt) / 1000);
+			const summary =
+				`Background job ${id} (${mode}${label ? `: ${label}` : ""}) finished.\n\n` +
+				`${results.length} agent(s), ${turns} turn(s), $${job.cost.toFixed(4)}, ${duration}s.\n\n` +
+				sections.join("\n\n---\n\n");
+
+			pi.sendMessage(
+				{
+					customType: BACKGROUND_EVENT,
+					content: summary,
+					display: true,
+					details: {
+						id,
+						mode,
+						label,
+						status: job.status,
+						cost: job.cost,
+						durationMs: Date.now() - job.startedAt,
+						results: results.map((r) => ({
+							agent: r.agent,
+							status: isFailedResult(r) ? "failed" : "completed",
+							task: r.task.slice(0, 400),
+							usage: r.usage,
+							model: r.model,
+						})),
+					},
+				},
+				{ triggerTurn: true, deliverAs: "followUp" },
+			);
+			ctx.ui.notify(`Background job ${id} finished (${job.status})`, job.status === "failed" ? "error" : "info");
+		} catch (err) {
+			job.status = "failed";
+			pi.sendMessage(
+				{
+					customType: BACKGROUND_EVENT,
+					content: `Background job ${id} failed: ${(err as Error).message}`,
+					display: true,
+					details: { id, mode, label, status: "failed" },
+				},
+				{ triggerTurn: true, deliverAs: "followUp" },
+			);
+			ctx.ui.notify(`Background job ${id} failed`, "error");
+		}
+	})();
+
+	return { id };
+}
+
+// ---------------------------------------------------------------------------
 // Extension
 // ---------------------------------------------------------------------------
 
 export default function (pi: ExtensionAPI) {
+	const backgroundJobs = new Map<string, BackgroundJob>();
+
+	// Background children are detached, so stop them when the session ends
+	// instead of leaving orphan processes behind.
+	pi.on("session_shutdown", () => {
+		for (const job of backgroundJobs.values()) {
+			if (job.status === "running") {
+				job.abort.abort();
+				job.status = "failed";
+			}
+		}
+	});
+
+	pi.registerCommand("orchestrate-jobs", {
+		description: "List background orchestrate jobs in this session",
+		handler: async (_args, ctx) => {
+			if (backgroundJobs.size === 0) {
+				ctx.ui.notify("No background orchestrate jobs in this session.", "info");
+				return;
+			}
+			const lines = [...backgroundJobs.values()].map((job) => {
+				const secs = Math.round((Date.now() - job.startedAt) / 1000);
+				return `${job.id}  ${job.status}  ${job.mode}${job.label ? ` "${job.label}"` : ""}  ` +
+					`${job.results.length} result(s)  $${job.cost.toFixed(4)}  ${secs}s`;
+			});
+			ctx.ui.notify(lines.join("\n"), "info");
+		},
+	});
+
 	pi.registerTool({
 		name: "orchestrate",
 		label: "Orchestrate",
@@ -614,6 +849,7 @@ export default function (pi: ExtensionAPI) {
 			"Modes: single (agent + task), parallel (tasks array), chain (sequential, supports {previous}, {context}, {step}).",
 			"Parallel tasks run asynchronously and all start immediately - use it for independent work. Set maxConcurrency only to protect a rate-limited provider.",
 			"Chain is only for steps whose task depends on a prior step's output; never chain what can run in parallel.",
+			"Set background: true to keep the conversation responsive during long runs; the report is delivered back when the job completes.",
 			"Pass accumulated knowledge to any child through the `context` field.",
 			`Default agent scope is "user" (from ${path.join(getAgentDir(), "agents")}).`,
 			`To enable project-local agents in ${CONFIG_DIR_NAME}/agents, set agentScope: "both" (or "project").`,
@@ -686,6 +922,45 @@ export default function (pi: ExtensionAPI) {
 							details: makeDetails(hasChain ? "chain" : hasTasks ? "parallel" : "single")([]),
 						};
 				}
+			}
+
+			// ---------------- background dispatch ----------------
+			if (params.background) {
+				// Project-local agents were already confirmed above (that check runs
+				// before this branch), so a detached job is safe to start here.
+				const label =
+					params.chain?.[0]?.label ??
+					params.tasks?.[0]?.agent ??
+					params.agent ??
+					"";
+				const mode: "single" | "parallel" | "chain" = hasChain ? "chain" : hasTasks ? "parallel" : "single";
+				const { id } = startBackgroundJob(pi, ctx as any, backgroundJobs, mode, label, params, {
+					agents,
+					diagnostics: discovery.diagnostics,
+					cwd: ctx.cwd,
+					agentScope,
+					defaults: dispatchDefaults,
+				}, makeDetails(mode));
+
+				const what =
+					mode === "chain"
+						? `chain of ${params.chain.length} step(s)`
+						: mode === "parallel"
+							? `${params.tasks.length} parallel task(s)`
+							: `agent ${params.agent}`;
+				return {
+					content: [
+						{
+							type: "text",
+							text:
+								`Started background job ${id} (${what}). ` +
+								"The agents are running now and the conversation is free; the combined report will be delivered " +
+								"automatically when the job finishes. Continue with other work, or use /orchestrate-jobs to check status. " +
+								"Do not start the same work again while the job is running.",
+						},
+					],
+					details: makeDetails(mode)([]),
+				};
 			}
 
 			// ---------------- chain ----------------
